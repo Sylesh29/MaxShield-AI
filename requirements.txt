@@ -1,0 +1,9 @@
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0
+pydantic>=2.7.0
+langgraph>=1.2.2
+langchain-core>=0.3.0
+langchain-anthropic>=1.4.4
+anthropic>=0.52.0
+weave>=0.52.0
+python-dotenv>=1.0.1
