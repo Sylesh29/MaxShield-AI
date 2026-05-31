@@ -31,46 +31,61 @@ from schemas import (
     FinalDenialPreventionReport,
     GraphState,
 )
-from tools import fetch_payer_rules, verify_against_ncci_edits
+from tools import fetch_payer_rules, verify_claim_against_ncci_edits
 
 if not os.environ.get("WANDB_API_KEY"):
     os.environ.setdefault("WANDB_MODE", "disabled")
 
-_DEFAULT_MODEL = "claude-sonnet-4-6"
+_DEFAULT_REASONING_MODEL = "claude-sonnet-4-6"
+_DEFAULT_FAST_MODEL = "claude-haiku-4-5"
 
 
 # ---------------------------------------------------------------------------
 # Lazy LLM singletons
 # ---------------------------------------------------------------------------
 
-_base_llm: ChatAnthropic | None = None
-_llm_assessment_instance = None
+_llm_clients: dict[str, ChatAnthropic] = {}
+_llm_assessment_instances: dict[str, Any] = {}
 _llm_report_instance = None
 
 
-def _make_llm() -> ChatAnthropic:
+def _make_llm(model: str) -> ChatAnthropic:
     return ChatAnthropic(
-        model=os.environ.get("CLAUDE_MODEL", _DEFAULT_MODEL),
+        model=model,
         anthropic_api_key=os.environ["ANTHROPIC_API_KEY"],
         temperature=0,
-        max_tokens=8192,
+        max_tokens=int(os.environ.get("CLAUDE_MAX_TOKENS", "4096")),
+        timeout=float(os.environ.get("CLAUDE_TIMEOUT_SECONDS", "90")),
+        max_retries=int(os.environ.get("CLAUDE_MAX_RETRIES", "1")),
     )
 
 
-def _get_llm_assessment():
-    global _base_llm, _llm_assessment_instance
-    if _llm_assessment_instance is None:
-        _base_llm = _make_llm()
-        _llm_assessment_instance = _base_llm.with_structured_output(AgentAssessment)
-    return _llm_assessment_instance
+def _get_llm_client(model: str) -> ChatAnthropic:
+    if model not in _llm_clients:
+        _llm_clients[model] = _make_llm(model)
+    return _llm_clients[model]
+
+
+def _get_llm_assessment(model_tier: str = "fast"):
+    model = (
+        os.environ.get("CLAUDE_FAST_MODEL", _DEFAULT_FAST_MODEL)
+        if model_tier == "fast"
+        else os.environ.get("CLAUDE_REASONING_MODEL")
+        or os.environ.get("CLAUDE_MODEL", _DEFAULT_REASONING_MODEL)
+    )
+    if model not in _llm_assessment_instances:
+        _llm_assessment_instances[model] = _get_llm_client(model).with_structured_output(AgentAssessment)
+    return _llm_assessment_instances[model]
 
 
 def _get_llm_report():
-    global _base_llm, _llm_report_instance
+    global _llm_report_instance
     if _llm_report_instance is None:
-        if _base_llm is None:
-            _base_llm = _make_llm()
-        _llm_report_instance = _base_llm.with_structured_output(FinalDenialPreventionReport)
+        model = (
+            os.environ.get("CLAUDE_REASONING_MODEL")
+            or os.environ.get("CLAUDE_MODEL", _DEFAULT_REASONING_MODEL)
+        )
+        _llm_report_instance = _get_llm_client(model).with_structured_output(FinalDenialPreventionReport)
     return _llm_report_instance
 
 
@@ -152,7 +167,7 @@ def clinical_validator_node(state: GraphState) -> dict:
                 + _serialise_claim(payload)
             )),
         ]
-        assessment: AgentAssessment = _get_llm_assessment().invoke(messages)
+        assessment: AgentAssessment = _get_llm_assessment("fast").invoke(messages)
         assessment = assessment.model_copy(update={"agent_name": "Clinical_Validator_Agent"})
 
     return {"assessments": [assessment]}
@@ -208,7 +223,7 @@ def payer_compliance_node(state: GraphState) -> dict:
                 + _serialise_claim(payload)
             )),
         ]
-        assessment: AgentAssessment = _get_llm_assessment().invoke(messages)
+        assessment: AgentAssessment = _get_llm_assessment("fast").invoke(messages)
         assessment = assessment.model_copy(update={"agent_name": "Payer_Compliance_Agent"})
 
     return {"assessments": [assessment]}
@@ -299,7 +314,7 @@ def deep_audit_node(state: GraphState) -> dict:
                 + _serialise_claim(payload)
             )),
         ]
-        assessment: AgentAssessment = _get_llm_assessment().invoke(messages)
+        assessment: AgentAssessment = _get_llm_assessment("fast").invoke(messages)
         assessment = assessment.model_copy(update={"agent_name": "Deep_Audit_Agent"})
 
     return {"assessments": [assessment]}
@@ -316,7 +331,9 @@ available agent assessments into a final FinalDenialPreventionReport.
 SCORING FORMULA:
 - Base score = (payer_compliance_risk * 0.60) + (clinical_risk * 0.40) * 100
 - If Deep_Audit_Agent ran: weight its risk_score at 50%, redistribute others 30/20
-- Each CRITICAL NCCI violation: +15 points (cap at 98)
+- Each unresolved CRITICAL NCCI violation: +15 points (cap at 98)
+- Resolved NCCI edits with the required modifier already present should not
+  increase denial probability, but should be mentioned as an audit pass.
 - If all recommended fixes are applied: target score should drop below 30
 
 FINANCIAL IMPACT:
@@ -347,8 +364,10 @@ def orchestrator_denial_predictor_node(state: GraphState) -> dict:
     assessments = _deserialise_assessments(state.assessments)
     cpt_codes = _cpt_codes_from_payload(payload)
 
-    # Deterministic NCCI check -- always runs, no LLM hallucination risk
-    ncci_result = verify_against_ncci_edits(cpt_codes)
+    # Deterministic NCCI check -- always runs, no LLM hallucination risk.
+    # This claim-aware variant checks submitted modifiers, so a 99214-25 line
+    # is treated as a resolved edit instead of an active denial risk.
+    ncci_result = verify_claim_against_ncci_edits(payload.proposed_codes)
 
     agents_ran = [a.agent_name for a in assessments]
     avg_risk = sum(a.risk_score for a in assessments) / len(assessments) if assessments else 0

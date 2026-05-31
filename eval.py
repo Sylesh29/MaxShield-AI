@@ -96,7 +96,7 @@ EVAL_DATASET: list[dict[str, Any]] = [
         },
         "expected": {
             "should_flag_denial_risk": False,
-            "ncci_violation_expected": True,
+            "ncci_violation_expected": False,
             "optimized_payload_should_have_modifier_25_on_99214": True,
             "max_denial_probability": 35,
         },
@@ -213,11 +213,14 @@ def score_denial_flag_accuracy(expected: dict, output: dict) -> dict:
 @weave.op()
 def score_ncci_detection(expected: dict, output: dict) -> dict:
     """
-    Checks whether the deterministic NCCI engine correctly detected (or passed) bundling.
-    This should always be 1.0 — if it's not, the rules engine has a bug.
+    Checks whether the deterministic NCCI engine correctly detected unresolved
+    edits. Resolved edits with the required modifier present are audit passes,
+    not active denial risks.
     """
     ncci_details = output.get("ncci_edit_details", {})
-    ncci_found_violation = not ncci_details.get("passed", True)
+    ncci_found_violation = ncci_details.get("unresolved_count", 0) > 0
+    if "unresolved_count" not in ncci_details:
+        ncci_found_violation = not ncci_details.get("passed", True)
     expected_violation = expected.get("ncci_violation_expected", False)
     correct = ncci_found_violation == expected_violation
     return {

@@ -28,7 +28,7 @@ from fastapi.staticfiles import StaticFiles
 # empty-string env vars from a previous failed load (e.g., BOM encoding issue).
 load_dotenv(override=True)
 
-from graph import execute_scrubbing_pipeline, stream_scrubbing_pipeline
+from graph import _is_fast_demo_candidate, execute_scrubbing_pipeline, stream_scrubbing_pipeline
 from schemas import (
     ClaimPayload,
     ClinicalNote,
@@ -62,9 +62,14 @@ async def lifespan(app: FastAPI):
         print("W&B Weave tracing disabled -- set WANDB_API_KEY in .env to enable")
 
     anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
-    model = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-6")
+    fast_model = os.environ.get("CLAUDE_FAST_MODEL", "claude-haiku-4-5")
+    reasoning_model = os.environ.get(
+        "CLAUDE_REASONING_MODEL",
+        os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-6"),
+    )
     if anthropic_key:
-        print(f"Claude model: {model}")
+        print(f"Claude fast model: {fast_model}")
+        print(f"Claude reasoning model: {reasoning_model}")
     else:
         print("WARNING: ANTHROPIC_API_KEY not set -- POST /api/v1/scrub-claim will return 503")
 
@@ -135,7 +140,7 @@ async def scrub_claim(payload: ClaimPayload) -> FinalDenialPreventionReport:
     The synchronous LangGraph pipeline runs in a thread pool so it never
     blocks the asyncio event loop.
     """
-    if not os.environ.get("ANTHROPIC_API_KEY", "").strip():
+    if not os.environ.get("ANTHROPIC_API_KEY", "").strip() and not _is_fast_demo_candidate(payload):
         raise HTTPException(
             status_code=503,
             detail=(
@@ -185,7 +190,7 @@ async def scrub_claim_stream(payload: ClaimPayload, request: Request):
              -H "Content-Type: application/json"
              -d @claim_payload.json
     """
-    if not os.environ.get("ANTHROPIC_API_KEY", "").strip():
+    if not os.environ.get("ANTHROPIC_API_KEY", "").strip() and not _is_fast_demo_candidate(payload):
         raise HTTPException(
             status_code=503,
             detail="ANTHROPIC_API_KEY is not configured. Set it in your .env file.",

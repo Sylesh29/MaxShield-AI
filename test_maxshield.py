@@ -151,7 +151,7 @@ def test_schemas():
 # ---------------------------------------------------------------------------
 
 def test_ncci():
-    from tools import verify_against_ncci_edits
+    from tools import verify_against_ncci_edits, verify_claim_against_ncci_edits
 
     results = []
 
@@ -199,9 +199,39 @@ def test_ncci():
             "is actually appended to the code in the payload"
         )
 
+    def t_claim_aware_missing_modifier_25_unresolved():
+        r = verify_claim_against_ncci_edits([
+            {"code": "99214", "code_type": "CPT", "description": "E&M", "modifiers": []},
+            {"code": "20610", "code_type": "CPT", "description": "Joint injection", "modifiers": []},
+        ])
+        assert r["passed"] is False
+        assert r["unresolved_count"] == 1
+        assert r["violations"][0]["status"] == "unresolved"
+
+    def t_claim_aware_modifier_25_resolves_edit():
+        r = verify_claim_against_ncci_edits([
+            {"code": "99214", "code_type": "CPT", "description": "E&M", "modifiers": ["25"]},
+            {"code": "20610", "code_type": "CPT", "description": "Joint injection", "modifiers": []},
+        ])
+        assert r["passed"] is True
+        assert r["unresolved_count"] == 0
+        assert r["resolved_count"] == 1
+        assert r["resolved_edits"][0]["status"] == "resolved_by_modifier"
+
+    def t_claim_aware_component_code_stays_unresolved():
+        r = verify_claim_against_ncci_edits([
+            {"code": "45378", "code_type": "CPT", "description": "Diagnostic colonoscopy", "modifiers": []},
+            {"code": "45380", "code_type": "CPT", "description": "Colonoscopy with biopsy", "modifiers": []},
+        ])
+        assert r["passed"] is False
+        assert r["violations"][0]["status"] == "unresolvable_component_code"
+
     for fn in [t_99214_20610_flagged, t_99213_20610_flagged, t_reverse_order_detected,
                t_clean_codes_pass, t_single_code_no_pairs, t_colonoscopy_biopsy_bundled,
-               t_checked_pairs_format, t_modifier_25_present_still_flagged_by_engine]:
+               t_checked_pairs_format, t_modifier_25_present_still_flagged_by_engine,
+               t_claim_aware_missing_modifier_25_unresolved,
+               t_claim_aware_modifier_25_resolves_edit,
+               t_claim_aware_component_code_stays_unresolved]:
         results.append(run_test(fn.__name__, fn))
     return results
 
@@ -295,8 +325,86 @@ def test_graph_structure():
             "assessments must use Annotated[list, operator.add] for parallel-safe merging"
         )
 
+    def t_demo_ncci_violation_forces_deep_audit_triage():
+        from graph import _route_after_triage, _triage_router_wrapper
+
+        state = {
+            "payload": {
+                "clinical_note": {
+                    "raw_text": "Demo note with separate E&M and same-day joint injection.",
+                    "provider_id": "NPI-TEST",
+                    "payer_name": "Aetna",
+                },
+                "proposed_codes": [
+                    {"code": "99214", "code_type": "CPT", "description": "E&M", "modifiers": []},
+                    {"code": "20610", "code_type": "CPT", "description": "Joint injection", "modifiers": []},
+                ],
+            },
+            "assessments": [
+                {"agent_name": "Clinical_Validator_Agent", "approval_status": "FLAGGED", "risk_score": 0.30},
+                {"agent_name": "Payer_Compliance_Agent", "approval_status": "FLAGGED", "risk_score": 0.40},
+            ],
+        }
+        update = _triage_router_wrapper(state)
+        assert update["triage_risk_max"] > 0.75
+        assert _route_after_triage({**state, **update}) == "deep_audit"
+
+    def t_resolved_modifier_25_does_not_force_deep_audit_triage():
+        from graph import _route_after_triage, _triage_router_wrapper
+
+        state = {
+            "payload": {
+                "clinical_note": {
+                    "raw_text": "Clean note with Modifier 25 already submitted.",
+                    "provider_id": "NPI-TEST",
+                    "payer_name": "Aetna",
+                },
+                "proposed_codes": [
+                    {"code": "99214", "code_type": "CPT", "description": "E&M", "modifiers": ["25"]},
+                    {"code": "20610", "code_type": "CPT", "description": "Joint injection", "modifiers": []},
+                ],
+            },
+            "assessments": [
+                {"agent_name": "Clinical_Validator_Agent", "approval_status": "APPROVED", "risk_score": 0.20},
+                {"agent_name": "Payer_Compliance_Agent", "approval_status": "APPROVED", "risk_score": 0.25},
+            ],
+        }
+        update = _triage_router_wrapper(state)
+        assert update["triage_risk_max"] == 0.25
+        assert update["ncci_edit_details"]["resolved_count"] == 1
+        assert _route_after_triage({**state, **update}) == "denial_predictor"
+
+    def t_fast_demo_stream_emits_deep_audit_without_llm():
+        from graph import stream_scrubbing_pipeline
+        from schemas import ClaimPayload, ClinicalNote, CodeType, MedicalCode
+
+        payload = ClaimPayload(
+            clinical_note=ClinicalNote(
+                raw_text="Demo note with separate E&M and same-day joint injection.",
+                provider_id="NPI-TEST",
+                payer_name="Aetna",
+            ),
+            proposed_codes=[
+                MedicalCode(code="99214", code_type=CodeType.CPT, description="E&M", modifiers=[]),
+                MedicalCode(code="20610", code_type=CodeType.CPT, description="Joint injection", modifiers=[]),
+            ],
+        )
+        chunks = list(stream_scrubbing_pipeline(payload))
+        nodes = [chunk["node"] for chunk in chunks]
+        assert nodes == [
+            "clinical_validator",
+            "payer_compliance",
+            "triage_router",
+            "deep_audit",
+            "denial_predictor",
+        ]
+        assert chunks[-1]["update"]["final_report"]["deep_audit_triggered"] is True
+
     for fn in [t_graph_compiles, t_graph_has_five_nodes, t_execute_function_exists,
-               t_parallel_fan_out_nodes_present, t_state_uses_annotated_assessments]:
+               t_parallel_fan_out_nodes_present, t_state_uses_annotated_assessments,
+               t_demo_ncci_violation_forces_deep_audit_triage,
+               t_resolved_modifier_25_does_not_force_deep_audit_triage,
+               t_fast_demo_stream_emits_deep_audit_without_llm]:
         results.append(run_test(fn.__name__, fn))
     return results
 
@@ -350,10 +458,35 @@ def test_api_endpoints():
         def t_scrub_claim_503_without_key():
             saved = os.environ.pop("ANTHROPIC_API_KEY", None)
             try:
-                payload = client.get("/api/v1/mock-demo").json()["claim_payload"]
+                payload = {
+                    "clinical_note": {
+                        "raw_text": "Clean established patient visit, moderate MDM documented.",
+                        "provider_id": "NPI-CLEAN",
+                        "payer_name": "Aetna",
+                    },
+                    "proposed_codes": [
+                        {"code": "99214", "code_type": "CPT", "description": "E&M", "modifiers": []},
+                    ],
+                }
                 r = client.post("/api/v1/scrub-claim", json=payload)
                 assert r.status_code == 503, f"Expected 503, got {r.status_code}"
                 assert "ANTHROPIC_API_KEY" in r.json()["detail"]
+            finally:
+                if saved:
+                    os.environ["ANTHROPIC_API_KEY"] = saved
+
+        def t_fast_demo_scrub_200_without_key():
+            saved = os.environ.pop("ANTHROPIC_API_KEY", None)
+            try:
+                payload = client.get("/api/v1/mock-demo").json()["claim_payload"]
+                r = client.post("/api/v1/scrub-claim", json=payload)
+                assert r.status_code == 200, r.text
+                body = r.json()
+                assert body["deep_audit_triggered"] is True
+                assert "25" in next(
+                    c for c in body["optimized_claim_payload"]["proposed_codes"]
+                    if c["code"] == "99214"
+                )["modifiers"]
             finally:
                 if saved:
                     os.environ["ANTHROPIC_API_KEY"] = saved
@@ -375,7 +508,16 @@ def test_api_endpoints():
         def t_stream_endpoint_503_without_key():
             saved = os.environ.pop("ANTHROPIC_API_KEY", None)
             try:
-                payload = client.get("/api/v1/mock-demo").json()["claim_payload"]
+                payload = {
+                    "clinical_note": {
+                        "raw_text": "Clean established patient visit, moderate MDM documented.",
+                        "provider_id": "NPI-CLEAN",
+                        "payer_name": "Aetna",
+                    },
+                    "proposed_codes": [
+                        {"code": "99214", "code_type": "CPT", "description": "E&M", "modifiers": []},
+                    ],
+                }
                 r = client.post("/api/v1/scrub-claim/stream", json=payload)
                 assert r.status_code == 503
             finally:
@@ -384,7 +526,7 @@ def test_api_endpoints():
 
         for fn in [t_health_200, t_mock_demo_200, t_mock_demo_has_proposed_codes,
                    t_mock_demo_missing_modifier_25, t_scrub_claim_503_without_key,
-                   t_scrub_claim_422_bad_payload, t_openapi_schema_valid,
+                   t_fast_demo_scrub_200_without_key, t_scrub_claim_422_bad_payload, t_openapi_schema_valid,
                    t_stream_endpoint_503_without_key]:
             results.append(run_test(fn.__name__, fn))
 
@@ -436,7 +578,7 @@ def test_integration():
         assert report.financial_impact_saved_usd >= 0
         assert len(report.actionable_revisions) > 0
         assert report.transaction_id
-        assert len(report.agent_assessments) == 2
+        assert len(report.agent_assessments) >= 2
         assert report.ncci_edit_details.get("passed") is False, (
             "NCCI engine must flag the 99214+20610 bundle"
         )

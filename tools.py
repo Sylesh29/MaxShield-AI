@@ -147,6 +147,101 @@ def verify_against_ncci_edits(cpt_codes: list[str]) -> dict:
     }
 
 
+def _normalise_code_line(item, index: int) -> dict:
+    """Return a dict view for either a Pydantic MedicalCode or a raw dict."""
+    if isinstance(item, dict):
+        code_type = item.get("code_type", "")
+        modifiers = item.get("modifiers", [])
+        code = item.get("code", "")
+    else:
+        code_type = getattr(item, "code_type", "")
+        modifiers = getattr(item, "modifiers", [])
+        code = getattr(item, "code", "")
+
+    code_type_value = getattr(code_type, "value", code_type)
+    return {
+        "line_index": index,
+        "code": str(code).strip().upper(),
+        "code_type": str(code_type_value),
+        "modifiers": [str(m).strip().upper() for m in (modifiers or [])],
+    }
+
+
+def verify_claim_against_ncci_edits(code_lines: list) -> dict:
+    """
+    Claim-aware NCCI validator.
+
+    Unlike ``verify_against_ncci_edits()``, this function inspects the full code
+    lines, including modifiers. It separates raw code-pair edits from unresolved
+    denial risks so a correctly submitted 99214-25 + 20610 claim is treated as
+    resolved instead of being reported as an active violation.
+    """
+    normalised_lines = [
+        _normalise_code_line(item, index)
+        for index, item in enumerate(code_lines)
+    ]
+    cpt_lines = [line for line in normalised_lines if line["code_type"] == "CPT"]
+
+    checked_pairs: list[tuple[str, str]] = []
+    all_edits: list[dict] = []
+    unresolved_violations: list[dict] = []
+    resolved_edits: list[dict] = []
+
+    for i, line_a in enumerate(cpt_lines):
+        for line_b in cpt_lines[i + 1 :]:
+            pair = (line_a["code"], line_b["code"])
+            reverse_pair = (line_b["code"], line_a["code"])
+            checked_pairs.append(pair)
+
+            rule_pair = pair if pair in _NCCI_EDIT_TABLE else reverse_pair
+            rule = _NCCI_EDIT_TABLE.get(rule_pair)
+            if not rule:
+                continue
+
+            required_modifier = rule["modifier"]
+            target_code = rule_pair[0]
+            target_lines = [line for line in (line_a, line_b) if line["code"] == target_code]
+            modifier_present = bool(
+                required_modifier
+                and any(required_modifier in line["modifiers"] for line in target_lines)
+            )
+
+            status = "resolved_by_modifier" if rule["modifier_required"] and modifier_present else "unresolved"
+            if not rule["modifier_required"]:
+                status = "unresolvable_component_code"
+
+            edit = {
+                "column_1_code": rule_pair[0],
+                "column_2_code": rule_pair[1],
+                "submitted_pair": f"{pair[0]}<->{pair[1]}",
+                "modifier_required": rule["modifier_required"],
+                "required_modifier": required_modifier,
+                "modifier_present": modifier_present,
+                "status": status,
+                "rationale": rule["rationale"],
+                "severity": "INFO" if status == "resolved_by_modifier" else (
+                    "CRITICAL" if rule["modifier_required"] else "ERROR"
+                ),
+            }
+            all_edits.append(edit)
+
+            if status == "resolved_by_modifier":
+                resolved_edits.append(edit)
+            else:
+                unresolved_violations.append(edit)
+
+    return {
+        "passed": len(unresolved_violations) == 0,
+        "violations": unresolved_violations,
+        "resolved_edits": resolved_edits,
+        "all_edits": all_edits,
+        "unresolved_count": len(unresolved_violations),
+        "resolved_count": len(resolved_edits),
+        "checked_pairs": [f"{a}<->{b}" for a, b in checked_pairs],
+        "total_pairs_checked": len(checked_pairs),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Payer-Specific Policy Rules Database (mock)
 # ---------------------------------------------------------------------------

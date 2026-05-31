@@ -90,7 +90,7 @@ Agents fired:        4  (Deep Audit Agent triggered by high risk)
 | Decision | Rationale |
 |---|---|
 | Parallel fan-out (Clinical + Payer) | Neither agent depends on the other's output. Running simultaneously halves wall-clock time and demonstrates real multi-agent coordination. |
-| Deterministic fan-in triage | The routing decision (risk > 0.75 → Deep Audit) is computed without an LLM call. Routing logic must be auditable and reproducible. |
+| Deterministic fan-in triage | The routing decision (risk > 0.75 → Deep Audit) combines agent risk with deterministic NCCI risk. The demo's missing Modifier 25 forces the 4th-agent path even if an LLM under-scores the issue. |
 | Conditional Deep Audit Agent | A 4th agent pass is expensive. It only fires when the combined risk from the parallel agents justifies it — keeps low-risk claims fast. |
 | NCCI guardrail at orchestrator | Billing code combinations are legally defined rules. LLMs must not hallucinate these. The NCCI engine runs deterministically *before* the LLM synthesises the final report. |
 | `Annotated[list, operator.add]` state | Parallel nodes each return one assessment. LangGraph merges them via the reducer — no race conditions, no overwriting. |
@@ -99,7 +99,7 @@ Agents fired:        4  (Deep Audit Agent triggered by high risk)
 
 The single biggest risk in an agentic billing system is an LLM inventing or misremembering billing rules. MaxShield AI prevents this at two layers:
 
-1. **`verify_against_ncci_edits(cpt_codes)`** — A pure Python rules engine with 9 hardcoded NCCI edit pairs. The LLM never decides whether two codes are bundled. It only decides *how to fix* a violation the engine has already confirmed.
+1. **`verify_against_ncci_edits(cpt_codes)` + `verify_claim_against_ncci_edits(code_lines)`** — A pure Python rules engine with 9 hardcoded NCCI edit pairs. The claim-aware validator also checks submitted modifiers, separating unresolved violations from edits already resolved by Modifier 25/50. The LLM never decides whether two codes are bundled; it only decides how to explain and fix deterministic findings.
 
 2. **Dynamic payer rule injection** — `fetch_payer_rules(payer_name)` injects the exact text of carrier-specific policy into the Payer Compliance Agent's system prompt. The LLM reasons against real policy language, not generic billing guidelines.
 
@@ -148,14 +148,14 @@ Composite score = mean of all binary pass/fail metrics, logged per model per run
 
 | Layer | Technology |
 |---|---|
-| LLM | Anthropic Claude Sonnet 4.6 (`claude-sonnet-4-6`) via `langchain-anthropic` |
+| LLM | Claude Haiku 4.5 for fast assessment agents; Claude Sonnet 4.6 for final orchestration via `langchain-anthropic` |
 | Agent orchestration | LangGraph 1.2.2 — `StateGraph` with `Annotated` reducers |
 | LLM tracing & evaluation | W&B Weave 0.52.x — `@weave.op()`, `weave.Evaluation`, `weave.Dataset` |
 | Structured outputs | Pydantic v2 `.with_structured_output()` — no freeform text between nodes |
 | API layer | FastAPI 0.136+ with `asyncio.to_thread` (non-blocking LangGraph calls) |
 | SSE streaming | `asyncio.Queue` + thread pool — real-time agent progress events |
 | Frontend | Alpine.js 3 + Tailwind CSS — single-file SPA, no build step |
-| Validation | 33 deterministic tests across schemas, NCCI engine, payer rules, graph wiring, HTTP endpoints |
+| Validation | 40 deterministic tests across schemas, NCCI engine, payer rules, graph wiring, HTTP endpoints |
 
 ---
 
@@ -170,7 +170,7 @@ maxshield-ai/
 ├── main.py             # FastAPI app — REST + SSE streaming endpoints (429 lines)
 ├── eval.py             # W&B Weave evaluation harness, 5 cases × 5 scorers (409 lines)
 ├── start.py            # Single-command launcher with env-var validation (67 lines)
-├── test_maxshield.py   # 33 deterministic tests, no LLM required (523 lines)
+├── test_maxshield.py   # 40 deterministic tests, no LLM required
 ├── frontend/
 │   └── index.html      # Alpine.js SPA — agent timeline, gauge, before/after (1029 lines)
 ├── requirements.txt
@@ -222,7 +222,7 @@ Navigate to **http://127.0.0.1:8000** — click **Load Mock Demo** to pre-popula
 
 ```bash
 python test_maxshield.py
-# Results: 33/33 passed — ALL PASS
+# Results: 40/40 passed - ALL PASS
 ```
 
 ### 6. Run the Weave evaluation (requires API keys)
@@ -285,7 +285,7 @@ curl -N -X POST http://localhost:8000/api/v1/scrub-claim/stream \
 ```
 data: {"event":"node_complete","node":"clinical_validator","risk_score":0.42,"approval_status":"FLAGGED"}
 data: {"event":"node_complete","node":"payer_compliance","risk_score":0.88,"approval_status":"REJECTED"}
-data: {"event":"node_complete","node":"triage_router","routing_decision":"deep_audit","triage_risk_max":0.82}
+data: {"event":"node_complete","node":"triage_router","routing_decision":"deep_audit","triage_risk_max":0.92}
 data: {"event":"node_complete","node":"deep_audit","risk_score":0.71,"flaws_found":2}
 data: {"event":"node_complete","node":"denial_predictor"}
 data: {"event":"done","final_report":{...}}
@@ -301,7 +301,9 @@ Liveness probe — returns `{"status": "healthy"}`.
 
 ## The NCCI Rules Engine
 
-The deterministic guardrail layer covers 9 code-pair rules including:
+The deterministic guardrail layer covers 9 code-pair rules and reports whether each edit is unresolved or resolved by a submitted modifier. The raw pair detector catches bundling relationships; the claim-aware validator inspects the actual modifier list on each CPT line.
+
+Included rules:
 
 | Pair | Rule | Modifier Required |
 |---|---|---|
@@ -335,7 +337,7 @@ Distinct carrier-specific policy rules are injected for:
 |---|---|
 | **Agent Orchestration** | 5-node LangGraph graph: parallel fan-out, deterministic fan-in, conditional routing to a 4th agent on risk > 75%. Agents communicate exclusively via Pydantic structured outputs — no freeform text. |
 | **Utility** | Targets a real $265B/year problem. The demo shows a live claim correction with exact dollar impact. |
-| **Technical Execution** | Non-blocking `asyncio.to_thread` for all LLM calls, real-time SSE via `asyncio.Queue` + thread pool, 33 deterministic tests. |
+| **Technical Execution** | Non-blocking `asyncio.to_thread` for all LLM calls, deterministic fast path for the built-in NCCI demo, fast Haiku assessment agents, real-time SSE via `asyncio.Queue` + thread pool, 40 deterministic tests. |
 | **Creativity** | Combines deterministic guardrails (NCCI engine) with LLM reasoning — a hybrid architecture that prevents the failure mode (hallucination) that makes most medical AI non-deployable. |
 | **Sponsor Usage — Claude** | `claude-sonnet-4-6` via `langchain-anthropic` with `.with_structured_output()` on all 4 agents. Structured outputs enforce Pydantic schemas — no JSON parsing, no prompt engineering for format. |
 | **Sponsor Usage — W&B Weave** | `weave.init()` + `@weave.op()` on all agents + `weave.attributes()` per call + `weave.Evaluation` with 5 scorers across a 5-case golden dataset with `asyncio.to_thread` for concurrent evaluation. |
