@@ -173,12 +173,18 @@ def _build_fast_demo_report(payload: ClaimPayload) -> FinalDenialPreventionRepor
 
 
 def _fast_demo_stream(payload: ClaimPayload):
+    import time
     ncci_result = verify_claim_against_ncci_edits(payload.proposed_codes)
     report = _build_fast_demo_report(payload)
     assessments = [a.model_dump() for a in report.agent_assessments]
 
+    # Simulate realistic parallel agent execution timing so the pipeline
+    # animation is visible in the UI (clinical + payer run simultaneously).
+    time.sleep(1.6)
     yield {"node": "clinical_validator", "update": {"assessments": [assessments[0]]}}
+    time.sleep(0.4)
     yield {"node": "payer_compliance", "update": {"assessments": [assessments[1]]}}
+    time.sleep(0.4)
     yield {
         "node": "triage_router",
         "update": {
@@ -186,6 +192,7 @@ def _fast_demo_stream(payload: ClaimPayload):
             "ncci_edit_details": ncci_result,
         },
     }
+    time.sleep(1.8)
     yield {
         "node": "deep_audit",
         "update": {
@@ -193,6 +200,7 @@ def _fast_demo_stream(payload: ClaimPayload):
             "deep_audit_triggered": True,
         },
     }
+    time.sleep(2.6)
     yield {
         "node": "denial_predictor",
         "update": {
